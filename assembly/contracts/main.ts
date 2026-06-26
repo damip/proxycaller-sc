@@ -1,12 +1,17 @@
 /**
  * Massa "ProxyCaller" smart contract.
  *
- * The contract acts as a relayer-pays gateway: an off-chain user signs a "call
- * intent" (which target contract and function to invoke, with which arguments
- * and how many coins). A privileged relayer (the admin) submits the signed
- * intent to this contract; the contract verifies the signature, enforces
- * per-sender nonce continuity (anti-replay) and forwards the call. The native
- * return bytes of the inner call are returned as-is.
+ * The contract is a permissionless relayer-pays gateway: an end user signs a
+ * "call intent" off-chain (which target contract and function to invoke, with
+ * which arguments and how many coins). *Anyone* can then submit that signed
+ * intent to this contract and pay its gas; the contract verifies the signature,
+ * enforces per-sender nonce continuity (anti-replay) and forwards the call. The
+ * native return bytes of the inner call are returned as-is.
+ *
+ * There is intentionally NO admin / privileged relayer: security comes entirely
+ * from the user's signature plus the per-user monotonic nonce, so letting
+ * anyone relay a request is safe. The relayer cannot alter the call (any change
+ * invalidates the signature) nor replay it (the nonce only moves forward).
  *
  * The signed payload is bound to:
  *   - a domain separator string (`"massa-proxycaller-v1"`)
@@ -25,25 +30,20 @@ import {
   Context,
   Storage,
   call,
-  caller,
   callee,
   chainId,
   generateEvent,
   isSignatureValid,
   publicKeyToAddress,
-  validateAddress,
 } from '@massalabs/massa-as-sdk';
 import {
   Args,
-  bytesToString,
   bytesToU64,
   stringToBytes,
   u64ToBytes,
 } from '@massalabs/as-types';
 
 const DOMAIN_SEPARATOR: string = 'massa-proxycaller-v1';
-
-const ADMIN_KEY: StaticArray<u8> = stringToBytes('ADMIN');
 
 const NONCE_PREFIX: StaticArray<u8> = stringToBytes('N:');
 
@@ -82,27 +82,18 @@ function bytesToHex(arr: StaticArray<u8>): string {
 }
 
 /**
- * Constructor: stores the admin (relayer) address.
+ * Constructor.
  *
- * @param binaryArgs - serialized `Args` containing one string: the admin
- *                     address.
+ * The contract is fully permissionless and holds no configuration, so the
+ * constructor only guards against being re-run and emits a deploy event. It is
+ * kept because the standard Massa deployer invokes `constructor` on the freshly
+ * created contract.
+ *
+ * @param _ - unused.
  */
-export function constructor(binaryArgs: StaticArray<u8>): void {
+export function constructor(_: StaticArray<u8>): void {
   assert(Context.isDeployingContract(), 'constructor can only run on deploy');
-  const args = new Args(binaryArgs);
-  const admin = args
-    .nextString()
-    .expect('constructor: missing admin address');
-  assert(validateAddress(admin), 'constructor: invalid admin address');
-  Storage.set(ADMIN_KEY, stringToBytes(admin));
-  generateEvent('proxycaller deployed; admin=' + admin);
-}
-
-/**
- * Read-only getter for the admin address.
- */
-export function getAdmin(_: StaticArray<u8>): StaticArray<u8> {
-  return Storage.get(ADMIN_KEY);
+  generateEvent('proxycaller deployed (permissionless, no admin)');
 }
 
 /**
@@ -160,7 +151,8 @@ function buildSignedPayload(
 }
 
 /**
- * Relay an end-user signed call.
+ * Relay an end-user signed call. Callable by anyone — the submitter pays the
+ * gas, the signing user authorizes the call.
  *
  * Request format (`Args`):
  *   - publicKey   : string (base58check)
@@ -177,13 +169,6 @@ function buildSignedPayload(
  * @returns the raw bytes returned by the inner call.
  */
 export function relayCall(binaryArgs: StaticArray<u8>): StaticArray<u8> {
-  const adminBytes = Storage.get(ADMIN_KEY);
-  const adminStr = bytesToString(adminBytes);
-  assert(
-    caller().toString() == adminStr,
-    'relayCall: only the admin can relay calls',
-  );
-
   const args = new Args(binaryArgs);
   const publicKey = args.nextString().expect('relayCall: missing publicKey');
   const nonce = args.nextU64().expect('relayCall: missing nonce');
@@ -192,6 +177,16 @@ export function relayCall(binaryArgs: StaticArray<u8>): StaticArray<u8> {
     .expect('relayCall: missing callinfo');
   const signature = args.nextString().expect('relayCall: missing signature');
 
+  // Verify the signature first: this authenticates the request and binds it to
+  // this proxy/chain/nonce/callinfo. Only then do we touch storage.
+  const payload = buildSignedPayload(publicKey, nonce, callinfoBytes);
+  assert(
+    isSignatureValid(publicKey, payload, signature),
+    'relayCall: invalid signature',
+  );
+
+  // Nonce continuity (anti-replay), keyed by the address derived from the
+  // signed public key (not by the submitter).
   const senderAddr = publicKeyToAddress(publicKey).toString();
   const nKey = nonceKey(stringToBytes(senderAddr));
   let prevNonce: u64 = 0;
@@ -200,12 +195,6 @@ export function relayCall(binaryArgs: StaticArray<u8>): StaticArray<u8> {
   }
   assert(nonce == prevNonce + 1, 'relayCall: nonce discontinuity');
   Storage.set(nKey, u64ToBytes(nonce));
-
-  const payload = buildSignedPayload(publicKey, nonce, callinfoBytes);
-  assert(
-    isSignatureValid(publicKey, payload, signature),
-    'relayCall: invalid signature',
-  );
 
   const callinfo = new Args(callinfoBytes);
   const targetAddress = callinfo

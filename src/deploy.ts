@@ -7,13 +7,13 @@
  *   npm run deploy
  *
  * The script reads PRIVATE_KEY from the environment (.env file) and uses that
- * account as both:
- *   - the funder paying for deployments and gas;
- *   - the "admin" / relayer of the ProxyCaller.
+ * account to fund deployments and to pay for relayed calls.
  *
- * For the actual proxied call, the script generates a fresh ephemeral key pair
- * (the "user"). The user signs a call intent locally, the relayer submits it,
- * and the script then verifies the side effects on chain.
+ * ProxyCaller is permissionless: there is no admin. To prove this, the script
+ * relays one user call from the main funded account and a second user call from
+ * a *freshly generated, independent* account (funded with a small transfer).
+ * The signing "user" is a separate ephemeral key with zero MAS — it only
+ * authorizes calls by signing, it never sends operations itself.
  */
 
 import 'dotenv/config';
@@ -23,8 +23,6 @@ import {
   JsonRpcProvider,
   Mas,
   PrivateKey,
-  PublicKey,
-  Signature,
   SmartContract,
   bytesToStr,
   strToBytes,
@@ -90,7 +88,7 @@ function buildCallInfo(
 }
 
 /**
- * Build the request `Args` that the relayer sends to `relayCall`.
+ * Build the request `Args` sent to `relayCall`.
  */
 function buildRelayRequest(
   publicKey: string,
@@ -110,11 +108,11 @@ async function deployContract(
   provider: JsonRpcProvider,
   wasmName: string,
   ctorArgs: Args,
-  coins: Mas,
+  coins: bigint,
   label: string,
 ): Promise<SmartContract> {
-  console.log(`[deploy] ${label}: compiling done; deploying ${wasmName}…`);
-  const byteCode = getScByteCode('build', wasmName);
+  console.log(`[deploy] ${label}: deploying ${wasmName}…`);
+  const byteCode = new Uint8Array(getScByteCode('build', wasmName));
   const contract = await SmartContract.deploy(provider, byteCode, ctorArgs, {
     coins,
   });
@@ -122,15 +120,20 @@ async function deployContract(
   return contract;
 }
 
+const SPECULATIVE_ERROR = 3;
+const FINAL_ERROR = 5;
+
 // --------- main ------------------------------------------------------------
 
 async function main(): Promise<void> {
-  // Account that pays for deployments + acts as the relayer.
-  const relayer = await Account.fromEnv();
-  const provider = JsonRpcProvider.buildnet(relayer);
+  // Main funded account: pays for deployments and for the first relay.
+  const payer = await Account.fromEnv();
+  const provider = JsonRpcProvider.buildnet(payer);
 
-  console.log(`[setup] relayer/admin address: ${relayer.address.toString()}`);
-  console.log(`[setup] relayer balance: ${(await provider.balance()).toString()} nMAS`);
+  console.log(`[setup] payer address: ${payer.address.toString()}`);
+  console.log(
+    `[setup] payer balance: ${(await provider.balance()).toString()} nMAS`,
+  );
 
   const status = await provider.getNodeStatus();
   const chainId = BigInt(status.chainId);
@@ -145,192 +148,184 @@ async function main(): Promise<void> {
     'echo',
   );
 
-  // 2. Deploy the ProxyCaller, with the relayer as admin.
+  // 2. Deploy the ProxyCaller. No constructor arguments — it is permissionless.
   const proxy = await deployContract(
     provider,
     'main.wasm',
-    new Args().addString(relayer.address.toString()),
+    new Args(),
     Mas.fromString('0.05'),
     'proxycaller',
   );
 
-  // 3. Generate a fresh "user" key pair. The user has zero MAS — only the
-  //    relayer pays — but it is the user that authorizes the call by signing.
+  // 3. Generate a fresh "user" key pair. The user has zero MAS — relayers pay —
+  //    but it is the user that authorizes calls by signing.
   const userPriv = PrivateKey.generate();
   const userPub = await userPriv.getPublicKey();
   const userAddress = userPub.getAddress().toString();
   console.log(`[setup] user (no funds) address: ${userAddress}`);
   console.log(`[setup] user public key:        ${userPub.toString()}`);
 
-  // 4. Build the inner call: echo.setMessage("hello via proxy"). We forward
-  //    a bit of MAS to the inner call so the echo contract can pay for the
-  //    storage entries it creates.
-  const message = `hello via proxy @ ${new Date().toISOString()}`;
-  const innerArgs = new Args().addString(message).serialize();
   const innerCallCoins = Mas.fromString('0.1');
-  const callinfoBytes = buildCallInfo(
-    echo.address,
-    'setMessage',
-    innerArgs,
-    innerCallCoins,
-  );
 
-  // 5. Build the canonical signed payload and sign it with the user key.
-  const nonce = 1n;
-  const payloadHex = buildSignedPayload(
-    chainId,
-    proxy.address,
-    userPub.toString(),
-    nonce,
-    callinfoBytes,
-  );
-  const signature = await userPriv.sign(strToBytes(payloadHex));
-  const sigStr = signature.toString();
-  console.log(`[sign] payload length (hex chars): ${payloadHex.length}`);
-  console.log(`[sign] signature: ${sigStr}`);
+  // Helper that builds + signs a relay request for the user.
+  async function makeSignedRequest(
+    nonce: bigint,
+    message: string,
+    signWith: PrivateKey,
+  ): Promise<{ param: Uint8Array; message: string }> {
+    const innerArgs = new Args().addString(message).serialize();
+    const callinfoBytes = buildCallInfo(
+      echo.address,
+      'setMessage',
+      innerArgs,
+      innerCallCoins,
+    );
+    const payloadHex = buildSignedPayload(
+      chainId,
+      proxy.address,
+      userPub.toString(),
+      nonce,
+      callinfoBytes,
+    );
+    const sig = (await signWith.sign(strToBytes(payloadHex))).toString();
+    return {
+      param: buildRelayRequest(userPub.toString(), nonce, callinfoBytes, sig),
+      message,
+    };
+  }
 
-  // 6. Submit the relay call.
-  const relayParam = buildRelayRequest(
-    userPub.toString(),
-    nonce,
-    callinfoBytes,
-    sigStr,
-  );
-  console.log('[relay] sending relayCall…');
-  const op = await proxy.call('relayCall', relayParam, {
+  // 4. Relay #1, submitted and paid by the main `payer` account.
+  const msg1 = `hello via proxy (relayer #1) @ ${new Date().toISOString()}`;
+  const req1 = await makeSignedRequest(1n, msg1, userPriv);
+  console.log('[relay#1] sending relayCall (paid by payer)…');
+  const op1 = await proxy.call('relayCall', req1.param, {
     coins: innerCallCoins,
     maxGas: 4_000_000_000n,
   });
-  console.log(`[relay] operation id: ${op.id}`);
-  const status1 = await op.waitSpeculativeExecution();
-  console.log(`[relay] speculative status: ${status1}`);
-
-  const events = await op.getSpeculativeEvents();
-  for (const evt of events) {
+  console.log(`[relay#1] operation id: ${op1.id}`);
+  console.log(`[relay#1] speculative status: ${await op1.waitSpeculativeExecution()}`);
+  for (const evt of await op1.getSpeculativeEvents()) {
     console.log(`[event] ${evt.data}`);
   }
 
-  // 7. Read echo storage to verify the message was set. The echo contract
-  //    keys messages by the *immediate* caller — which, when going through the
-  //    proxy, is the proxy contract itself.
-  const storedRead = await echo.read(
-    'getMessage',
-    new Args().addString(proxy.address),
+  // Verify echo stored the signed message (keyed by the proxy, the immediate
+  // caller seen by echo).
+  let storedMsg = bytesToStr(
+    (await echo.read('getMessage', new Args().addString(proxy.address))).value,
   );
-  const storedMsg = bytesToStr(storedRead.value);
-  console.log(
-    `[verify] echo.getMessage("${proxy.address}") = "${storedMsg}"`,
-  );
-  if (storedMsg !== message) {
-    throw new Error(
-      `verification failed: stored="${storedMsg}", expected="${message}"`,
-    );
+  console.log(`[verify] echo.getMessage(proxy) = "${storedMsg}"`);
+  if (storedMsg !== msg1) {
+    throw new Error(`verification failed: stored="${storedMsg}", expected="${msg1}"`);
   }
-  console.log('[verify] OK: stored message matches the one signed by the user.');
-
-  const lastCallerRead = await echo.read('lastCaller');
-  const lastCaller = bytesToStr(lastCallerRead.value);
-  console.log(`[verify] echo.lastCaller = ${lastCaller}`);
+  const lastCaller = bytesToStr((await echo.read('lastCaller')).value);
   if (lastCaller !== proxy.address) {
     throw new Error(
-      `verification failed: echo.lastCaller="${lastCaller}", expected proxy address "${proxy.address}"`,
+      `verification failed: echo.lastCaller="${lastCaller}", expected proxy "${proxy.address}"`,
     );
   }
-  console.log('[verify] OK: echo saw the proxy contract as immediate caller.');
+  console.log('[verify] OK: relay #1 succeeded; echo saw the proxy as caller.');
 
-  // 8. Verify nonce continuity by replaying the same signed message.
-  console.log('[replay] re-submitting the same request — must fail with nonce error');
-  let replayFailed = false;
+  // 5. Relay #2, submitted and paid by a SECOND, independent account. This
+  //    proves the contract is permissionless (no admin). We fund the new
+  //    account with a small transfer from the payer.
+  const relayer2 = await Account.generate();
+  const provider2 = JsonRpcProvider.buildnet(relayer2);
+  const proxyFrom2 = new SmartContract(provider2, proxy.address);
+  console.log(`[setup] independent relayer #2 address: ${relayer2.address.toString()}`);
+  console.log('[fund] funding relayer #2 with 1 MAS (waiting for final execution)…');
+  const fundOp = await provider.transfer(relayer2.address, Mas.fromString('1'));
+  // Wait for FINAL execution: the balance used by the next operation's
+  // pre-flight balance check is the final balance, not the speculative one.
+  console.log(`[fund] transfer status: ${await fundOp.waitFinalExecution()}`);
+  console.log(
+    `[fund] relayer #2 final balance: ${(await provider2.balance(true)).toString()} nMAS`,
+  );
+
+  const msg2 = `hello via proxy (relayer #2) @ ${new Date().toISOString()}`;
+  const req2 = await makeSignedRequest(2n, msg2, userPriv);
+  console.log('[relay#2] sending relayCall (paid by independent relayer #2)…');
+  const op2 = await proxyFrom2.call('relayCall', req2.param, {
+    coins: innerCallCoins,
+    maxGas: 4_000_000_000n,
+  });
+  console.log(`[relay#2] operation id: ${op2.id}`);
+  const st2 = await op2.waitSpeculativeExecution();
+  console.log(`[relay#2] speculative status: ${st2}`);
+  for (const evt of await op2.getSpeculativeEvents()) {
+    console.log(`[event] ${evt.data}`);
+  }
+  if (st2 === SPECULATIVE_ERROR || st2 === FINAL_ERROR) {
+    throw new Error('relay #2 from an independent account failed — permissionless check FAILED');
+  }
+  storedMsg = bytesToStr(
+    (await echo.read('getMessage', new Args().addString(proxy.address))).value,
+  );
+  console.log(`[verify] echo.getMessage(proxy) = "${storedMsg}"`);
+  if (storedMsg !== msg2) {
+    throw new Error(`verification failed: stored="${storedMsg}", expected="${msg2}"`);
+  }
+  console.log('[verify] OK: ANYONE can relay — a second independent account relayed successfully.');
+
+  // 6. Replay protection: re-submit relay #1 — must fail (nonce already used).
+  console.log('[replay] re-submitting relay #1 — must fail with nonce error');
+  let replayRejected = false;
   try {
-    const opR = await proxy.call('relayCall', relayParam, {
-      coins: Mas.fromString('0'),
+    const opR = await proxy.call('relayCall', req1.param, {
+      coins: innerCallCoins,
       maxGas: 4_000_000_000n,
     });
     const sR = await opR.waitSpeculativeExecution();
     console.log(`[replay] speculative status: ${sR}`);
-    const evR = await opR.getSpeculativeEvents();
-    for (const evt of evR) {
+    for (const evt of await opR.getSpeculativeEvents()) {
       console.log(`[replay event] ${evt.data}`);
-      if (evt.data.toLowerCase().includes('nonce')) {
-        replayFailed = true;
-      }
+      if (evt.data.toLowerCase().includes('nonce')) replayRejected = true;
     }
-    // SpeculativeError == 3 according to OperationStatus
-    if (sR === 3 || sR === 5) {
-      replayFailed = true;
-    }
+    if (sR === SPECULATIVE_ERROR || sR === FINAL_ERROR) replayRejected = true;
   } catch (e) {
     console.log(`[replay] threw as expected: ${(e as Error).message}`);
-    replayFailed = true;
+    replayRejected = true;
   }
-  if (!replayFailed) {
+  if (!replayRejected) {
     throw new Error('replay attack was NOT rejected — security check FAILED');
   }
   console.log('[verify] OK: replay was rejected.');
 
-  // 9. Verify a wrong signature is rejected.
-  console.log('[badsig] sending request signed by a DIFFERENT key — must fail');
+  // 7. Bad signature: request signed by a DIFFERENT key — must fail.
+  console.log('[badsig] sending request signed by a different key — must fail');
   const otherPriv = PrivateKey.generate();
-  const otherSig = (await otherPriv.sign(strToBytes(payloadHex))).toString();
-  const badNonce = 2n;
-  const badPayloadHex = buildSignedPayload(
-    chainId,
-    proxy.address,
-    userPub.toString(),
-    badNonce,
-    callinfoBytes,
-  );
-  // Sign the new payload but with the WRONG key.
-  const badSig = (await otherPriv.sign(strToBytes(badPayloadHex))).toString();
-  const badRelayParam = buildRelayRequest(
-    userPub.toString(),
-    badNonce,
-    callinfoBytes,
-    badSig,
-  );
-  let badSigFailed = false;
+  const badReq = await makeSignedRequest(3n, 'should never apply', otherPriv);
+  let badSigRejected = false;
   try {
-    const opB = await proxy.call('relayCall', badRelayParam, {
-      coins: Mas.fromString('0'),
+    const opB = await proxy.call('relayCall', badReq.param, {
+      coins: innerCallCoins,
       maxGas: 4_000_000_000n,
     });
     const sB = await opB.waitSpeculativeExecution();
     console.log(`[badsig] speculative status: ${sB}`);
-    const evB = await opB.getSpeculativeEvents();
-    for (const evt of evB) {
+    for (const evt of await opB.getSpeculativeEvents()) {
       console.log(`[badsig event] ${evt.data}`);
-      if (evt.data.toLowerCase().includes('signature')) {
-        badSigFailed = true;
-      }
+      if (evt.data.toLowerCase().includes('signature')) badSigRejected = true;
     }
-    if (sB === 3 || sB === 5) {
-      badSigFailed = true;
-    }
+    if (sB === SPECULATIVE_ERROR || sB === FINAL_ERROR) badSigRejected = true;
   } catch (e) {
     console.log(`[badsig] threw as expected: ${(e as Error).message}`);
-    badSigFailed = true;
+    badSigRejected = true;
   }
-  if (!badSigFailed) {
+  if (!badSigRejected) {
     throw new Error('a wrong signature was NOT rejected — security check FAILED');
   }
   console.log('[verify] OK: wrong signature was rejected.');
 
-  // 10. Verify on-chain nonce counter advanced for our user.
-  const nonceRead = await proxy.read(
-    'getNonce',
-    new Args().addString(userAddress),
-  );
-  const nonceBytes = nonceRead.value;
-  // u64 little-endian
+  // 8. Verify the on-chain nonce counter advanced to 2 for our user.
+  const nonceBytes = (await proxy.read('getNonce', new Args().addString(userAddress)))
+    .value;
   let storedNonce = 0n;
   for (let i = 0; i < 8 && i < nonceBytes.length; i++) {
     storedNonce |= BigInt(nonceBytes[i]) << BigInt(8 * i);
   }
   console.log(`[verify] proxy.getNonce(${userAddress}) = ${storedNonce}`);
-  if (storedNonce !== nonce) {
-    throw new Error(
-      `nonce mismatch: stored=${storedNonce}, expected=${nonce}`,
-    );
+  if (storedNonce !== 2n) {
+    throw new Error(`nonce mismatch: stored=${storedNonce}, expected=2`);
   }
   console.log('[verify] OK: stored nonce matches.');
 
