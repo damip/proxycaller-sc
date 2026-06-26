@@ -1,14 +1,13 @@
 {
-    "name": "my-massa-sc",
-    "version": "0.0.2",
-    "description": "",
+    "name": "proxycaller-sc",
+    "version": "1.0.0",
+    "description": "Permissionless gas-less call relayer smart contract for the Massa blockchain.",
     "main": "index.js",
     "scripts": {
         "test": "asp --summary",
         "build": "massa-as-compile",
         "clean": "rimraf build",
         "deploy": "npm run build && tsx src/deploy.ts",
-        "hello": "tsx src/hello.ts",
         "prettier": "prettier '**/src/**/*.ts' --check && as-prettier --check assembly",
         "prettier:fix": "prettier '**/src/**/*.ts' --write && as-prettier --write assembly",
         "lint": "eslint .",

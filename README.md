@@ -34,28 +34,46 @@ The high-level flow is:
 
 ## What's in here
 
-- `assembly/contracts/main.ts` — the `ProxyCaller` smart contract.
-- `assembly/contracts/echo.ts` — a tiny target contract used as an
-  end-to-end test target.
+- `assembly/contracts/main.ts` — the `ProxyCaller` smart contract (the only
+  contract; this is what gets deployed).
 - `assembly/__tests__/proxycaller.spec.ts` — AS-pect unit tests.
-- `src/deploy.ts` — a script that builds, deploys, and runs an end-to-end
-  test on Massa **Buildnet**: it deploys both contracts, then signs a payload
-  with a fresh ephemeral user key and relays it. It proves the contract is
-  permissionless by relaying a second call from a *different, independent*
-  account, and asserts that replays and bad-signature attempts are rejected.
+- `src/deploy.ts` — a minimal deployment script: it compiles and deploys the
+  ProxyCaller contract to the configured network.
 
-## Build & test
+## Build, test & deploy
 
 ```bash
-npm install            # already done by the boilerplate initializer
-npm run build          # compiles AssemblyScript -> build/*.wasm
+npm install            # install dependencies
+npm run build          # compiles AssemblyScript -> build/main.wasm
 npm test               # runs the AS-pect unit tests
-npm run deploy         # builds, deploys to Buildnet, runs e2e test
+npm run deploy         # builds and deploys the ProxyCaller contract
 ```
 
-`PRIVATE_KEY` is read from `.env`. The account it points to funds the
-deployments and pays for the relayed calls in the e2e test (but note that *any*
-account can relay — the contract enforces no caller restriction).
+### Deployment configuration
+
+Copy `.env.example` to `.env` and set:
+
+- `PRIVATE_KEY` (required): the secret key of the funded account paying for the
+  deployment.
+- `JSON_RPC_URL` (optional): the JSON-RPC endpoint to deploy to. When unset, the
+  public Massa **Buildnet** endpoint is used. Point it at a mainnet endpoint to
+  deploy on mainnet.
+
+On success the script prints the deployed contract address, e.g.:
+
+```
+ProxyCaller deployed at: AS1N2nRRHUJKa9spEKJhcSDa665VmDMLLZyFERqjmWeWbx165kpv
+```
+
+The deployed contract is immediately usable by anyone — there is no
+post-deployment configuration step.
+
+## Using the deployed contract
+
+A relayer submits a `relayCall` operation to the deployed contract with a
+request built and signed by the end user. See the ABI below for the exact
+serialization. Any account can submit the operation; only the user's signature
+authorizes the inner call.
 
 ## ProxyCaller ABI
 
